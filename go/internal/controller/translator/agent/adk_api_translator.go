@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
+	"net/url"
 	"os"
 	"slices"
 	"strconv"
@@ -41,7 +43,28 @@ const (
 
 	MCPServicePathDefault     = "/mcp"
 	MCPServiceProtocolDefault = v1alpha2.RemoteMCPServerProtocolStreamableHttp
+
+	ProxyHostHeader = "x-kagent-host"
 )
+
+// ValidationError indicates a configuration error that requires user action to fix.
+// These errors should not trigger exponential backoff retries.
+type ValidationError struct {
+	Err error
+}
+
+func (e *ValidationError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *ValidationError) Unwrap() error {
+	return e.Err
+}
+
+// NewValidationError creates a new ValidationError
+func NewValidationError(format string, args ...any) error {
+	return &ValidationError{Err: fmt.Errorf(format, args...)}
+}
 
 type ImageConfig struct {
 	Registry   string `json:"registry,omitempty"`
@@ -72,11 +95,12 @@ type AdkApiTranslator interface {
 
 type TranslatorPlugin = translator.TranslatorPlugin
 
-func NewAdkApiTranslator(kube client.Client, defaultModelConfig types.NamespacedName, plugins []TranslatorPlugin) AdkApiTranslator {
+func NewAdkApiTranslator(kube client.Client, defaultModelConfig types.NamespacedName, plugins []TranslatorPlugin, globalProxyURL string) AdkApiTranslator {
 	return &adkApiTranslator{
 		kube:               kube,
 		defaultModelConfig: defaultModelConfig,
 		plugins:            plugins,
+		globalProxyURL:     globalProxyURL,
 	}
 }
 
@@ -84,6 +108,7 @@ type adkApiTranslator struct {
 	kube               client.Client
 	defaultModelConfig types.NamespacedName
 	plugins            []TranslatorPlugin
+	globalProxyURL     string
 }
 
 const MAX_DEPTH = 10
@@ -111,51 +136,41 @@ func (a *adkApiTranslator) TranslateAgent(
 	ctx context.Context,
 	agent *v1alpha2.Agent,
 ) (*AgentOutputs, error) {
-
 	err := a.validateAgent(ctx, agent, &tState{})
 	if err != nil {
 		return nil, err
 	}
 
+	var cfg *adk.AgentConfig
+	var dep *resolvedDeployment
+	var secretHashBytes []byte
+
 	switch agent.Spec.Type {
 	case v1alpha2.AgentType_Declarative:
-
-		cfg, card, mdd, err := a.translateInlineAgent(ctx, agent)
+		var mdd *modelDeploymentData
+		cfg, mdd, secretHashBytes, err = a.translateInlineAgent(ctx, agent)
 		if err != nil {
 			return nil, err
 		}
-		dep, err := a.resolveInlineDeployment(agent, mdd)
+		dep, err = a.resolveInlineDeployment(agent, mdd)
 		if err != nil {
 			return nil, err
 		}
-		return a.buildManifest(ctx, agent, dep, cfg, card)
 
 	case v1alpha2.AgentType_BYO:
 
-		dep, err := a.resolveByoDeployment(agent)
+		dep, err = a.resolveByoDeployment(agent)
 		if err != nil {
 			return nil, err
 		}
-		// TODO: Resolve this from the actual pod
-		agentCard := &server.AgentCard{
-			Name:        strings.ReplaceAll(agent.Name, "-", "_"),
-			Description: agent.Spec.Description,
-			URL:         fmt.Sprintf("http://%s.%s:8080", agent.Name, agent.Namespace),
-			Capabilities: server.AgentCapabilities{
-				Streaming:              ptr.To(true),
-				PushNotifications:      ptr.To(false),
-				StateTransitionHistory: ptr.To(true),
-			},
-			// Can't be null for Python, so set to empty list
-			Skills:             []server.AgentSkill{},
-			DefaultInputModes:  []string{"text"},
-			DefaultOutputModes: []string{"text"},
-		}
-		return a.buildManifest(ctx, agent, dep, nil, agentCard)
 
 	default:
 		return nil, fmt.Errorf("unknown agent type: %s", agent.Spec.Type)
 	}
+
+	card := GetA2AAgentCard(agent)
+
+	return a.buildManifest(ctx, agent, dep, cfg, card, secretHashBytes)
 }
 
 // GetOwnedResourceTypes returns all the resource types that may be created for an agent.
@@ -178,7 +193,6 @@ func (r *adkApiTranslator) GetOwnedResourceTypes() []client.Object {
 }
 
 func (a *adkApiTranslator) validateAgent(ctx context.Context, agent *v1alpha2.Agent, state *tState) error {
-
 	agentRef := utils.GetObjectRef(agent)
 
 	if state.isVisited(agentRef) {
@@ -195,34 +209,29 @@ func (a *adkApiTranslator) validateAgent(ctx context.Context, agent *v1alpha2.Ag
 	}
 
 	for _, tool := range agent.Spec.Declarative.Tools {
-		if tool.Type != v1alpha2.ToolProviderType_Agent {
-			continue
-		}
+		switch tool.Type {
+		case v1alpha2.ToolProviderType_Agent:
+			if tool.Agent == nil {
+				return fmt.Errorf("tool must have an agent reference")
+			}
 
-		if tool.Agent == nil {
-			return fmt.Errorf("tool must have an agent reference")
-		}
+			agentRef := tool.Agent.NamespacedName(agent.Namespace)
 
-		agentRef := types.NamespacedName{
-			Namespace: agent.Namespace,
-			Name:      tool.Agent.Name,
-		}
+			if agentRef.Namespace == agent.Namespace && agentRef.Name == agent.Name {
+				return fmt.Errorf("agent tool cannot be used to reference itself, %s", agentRef)
+			}
 
-		if agentRef.Namespace == agent.Namespace && agentRef.Name == agent.Name {
-			return fmt.Errorf("agent tool cannot be used to reference itself, %s", agentRef)
-		}
+			toolAgent := &v1alpha2.Agent{}
+			err := a.kube.Get(ctx, agentRef, toolAgent)
+			if err != nil {
+				return err
+			}
 
-		toolAgent := &v1alpha2.Agent{}
-		err := a.kube.Get(ctx, agentRef, toolAgent)
-		if err != nil {
-			return err
+			err = a.validateAgent(ctx, toolAgent, state.with(agent))
+			if err != nil {
+				return err
+			}
 		}
-
-		err = a.validateAgent(ctx, toolAgent, state.with(agent))
-		if err != nil {
-			return err
-		}
-
 	}
 
 	return nil
@@ -234,11 +243,12 @@ func (a *adkApiTranslator) buildManifest(
 	dep *resolvedDeployment,
 	cfg *adk.AgentConfig, // nil for BYO
 	card *server.AgentCard, // nil for BYO
+	modelConfigSecretHashBytes []byte, // nil for BYO
 ) (*AgentOutputs, error) {
 	outputs := &AgentOutputs{}
 
 	// Optional config/card for Inline
-	var configHash uint64
+	var cfgHash uint64
 	var secretVol []corev1.Volume
 	var secretMounts []corev1.VolumeMount
 	var cfgJson string
@@ -252,7 +262,12 @@ func (a *adkApiTranslator) buildManifest(
 		if err != nil {
 			return nil, err
 		}
-		configHash = computeConfigHash(bCfg, bCard)
+		// Include secret hash bytes in config hash to trigger redeployment on secret changes
+		secretData := modelConfigSecretHashBytes
+		if secretData == nil {
+			secretData = []byte{}
+		}
+		cfgHash = computeConfigHash(bCfg, bCard, secretData)
 
 		cfgJson = string(bCfg)
 		agentCard = string(bCard)
@@ -299,14 +314,31 @@ func (a *adkApiTranslator) buildManifest(
 		},
 	})
 
-	// Service Account
-	outputs.Manifest = append(outputs.Manifest, &corev1.ServiceAccount{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "v1",
-			Kind:       "ServiceAccount",
-		},
-		ObjectMeta: objMeta(),
-	})
+	// Service Account - only created if using the default name
+	if *dep.ServiceAccountName == agent.Name {
+		sa := &corev1.ServiceAccount{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "v1",
+				Kind:       "ServiceAccount",
+			},
+			ObjectMeta: objMeta(),
+		}
+		if dep.ServiceAccountConfig != nil {
+			if dep.ServiceAccountConfig.Labels != nil {
+				if sa.Labels == nil {
+					sa.Labels = make(map[string]string)
+				}
+				maps.Copy(sa.Labels, dep.ServiceAccountConfig.Labels)
+			}
+			if dep.ServiceAccountConfig.Annotations != nil {
+				if sa.Annotations == nil {
+					sa.Annotations = make(map[string]string)
+				}
+				maps.Copy(sa.Annotations, dep.ServiceAccountConfig.Annotations)
+			}
+		}
+		outputs.Manifest = append(outputs.Manifest, sa)
+	}
 
 	// Base env for both types
 	sharedEnv := make([]corev1.EnvVar, 0, 8)
@@ -353,6 +385,10 @@ func (a *adkApiTranslator) buildManifest(
 		if insecure {
 			command = append(command, "--insecure")
 		}
+		initContainerSecurityContext := dep.SecurityContext
+		if initContainerSecurityContext != nil {
+			initContainerSecurityContext = initContainerSecurityContext.DeepCopy()
+		}
 		initContainers = append(initContainers, corev1.Container{
 			Name:    "skills-init",
 			Image:   dep.Image,
@@ -361,9 +397,8 @@ func (a *adkApiTranslator) buildManifest(
 			VolumeMounts: []corev1.VolumeMount{
 				{Name: "kagent-skills", MountPath: "/skills"},
 			},
-			Env: []corev1.EnvVar{
-				skillsEnv,
-			},
+			Env:             []corev1.EnvVar{skillsEnv},
+			SecurityContext: initContainerSecurityContext,
 		})
 		volumes = append(volumes, corev1.Volume{
 			Name: "kagent-skills",
@@ -411,14 +446,25 @@ func (a *adkApiTranslator) buildManifest(
 	if podTemplateAnnotations == nil {
 		podTemplateAnnotations = map[string]string{}
 	}
-	// Add config hash annotation to pod template to force rollout on config changes
-	podTemplateAnnotations["kagent.dev/config-hash"] = fmt.Sprintf("%d", configHash)
+	// Add hash annotations to pod template to force rollout on agent config or model config secret changes
+	podTemplateAnnotations["kagent.dev/config-hash"] = fmt.Sprintf("%d", cfgHash)
+
+	// Merge container security context: start with user-provided, then apply sandbox requirements
 	var securityContext *corev1.SecurityContext
-	if needSandbox {
+	if dep.SecurityContext != nil {
+		// Deep copy the user-provided security context
+		securityContext = dep.SecurityContext.DeepCopy()
+		// If sandbox is needed, ensure Privileged is set (may override user setting)
+		if needSandbox {
+			securityContext.Privileged = ptr.To(true)
+		}
+	} else if needSandbox {
+		// Only create security context if sandbox is needed
 		securityContext = &corev1.SecurityContext{
 			Privileged: ptr.To(true),
 		}
 	}
+	// If neither user-provided securityContext nor sandbox is needed, securityContext remains nil
 
 	deployment := &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
@@ -436,8 +482,9 @@ func (a *adkApiTranslator) buildManifest(
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels(), Annotations: podTemplateAnnotations},
 				Spec: corev1.PodSpec{
-					ServiceAccountName: agent.Name,
+					ServiceAccountName: *dep.ServiceAccountName,
 					ImagePullSecrets:   dep.ImagePullSecrets,
+					SecurityContext:    dep.PodSecurityContext,
 					InitContainers:     initContainers,
 					Containers: []corev1.Container{{
 						Name:            "kagent",
@@ -500,9 +547,8 @@ func (a *adkApiTranslator) buildManifest(
 	return outputs, a.runPlugins(ctx, agent, outputs)
 }
 
-func (a *adkApiTranslator) translateInlineAgent(ctx context.Context, agent *v1alpha2.Agent) (*adk.AgentConfig, *server.AgentCard, *modelDeploymentData, error) {
-
-	model, mdd, err := a.translateModel(ctx, agent.Namespace, agent.Spec.Declarative.ModelConfig)
+func (a *adkApiTranslator) translateInlineAgent(ctx context.Context, agent *v1alpha2.Agent) (*adk.AgentConfig, *modelDeploymentData, []byte, error) {
+	model, mdd, secretHashBytes, err := a.translateModel(ctx, agent.Namespace, agent.Spec.Declarative.ModelConfig)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -516,48 +562,31 @@ func (a *adkApiTranslator) translateInlineAgent(ctx context.Context, agent *v1al
 		Description: agent.Spec.Description,
 		Instruction: systemMessage,
 		Model:       model,
-		ExecuteCode: ptr.Deref(agent.Spec.Declarative.ExecuteCodeBlocks, false),
-	}
-	agentCard := &server.AgentCard{
-		Name:        strings.ReplaceAll(agent.Name, "-", "_"),
-		Description: agent.Spec.Description,
-		URL:         fmt.Sprintf("http://%s.%s:8080", agent.Name, agent.Namespace),
-		Capabilities: server.AgentCapabilities{
-			Streaming:              ptr.To(true),
-			PushNotifications:      ptr.To(false),
-			StateTransitionHistory: ptr.To(true),
-		},
-		// Can't be null for Python, so set to empty list
-		Skills:             []server.AgentSkill{},
-		DefaultInputModes:  []string{"text"},
-		DefaultOutputModes: []string{"text"},
-	}
-
-	if agent.Spec.Declarative.A2AConfig != nil {
-		agentCard.Skills = slices.Collect(utils.Map(slices.Values(agent.Spec.Declarative.A2AConfig.Skills), func(skill v1alpha2.AgentSkill) server.AgentSkill {
-			return server.AgentSkill(skill)
-		}))
+		ExecuteCode: false && ptr.Deref(agent.Spec.Declarative.ExecuteCodeBlocks, false), //ignored due to this issue https://github.com/google/adk-python/issues/3921.
+		Stream:      agent.Spec.Declarative.Stream,
 	}
 
 	for _, tool := range agent.Spec.Declarative.Tools {
+		headers, err := tool.ResolveHeaders(ctx, a.kube, agent.Namespace)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
 		// Skip tools that are not applicable to the model provider
 		switch {
 		case tool.McpServer != nil:
-			err := a.translateMCPServerTarget(ctx, cfg, agent.Namespace, tool.McpServer, tool.HeadersFrom)
+			// Use proxy for MCP server/tool communication
+			err := a.translateMCPServerTarget(ctx, cfg, agent.Namespace, tool.McpServer, headers, a.globalProxyURL)
 			if err != nil {
 				return nil, nil, nil, err
 			}
 		case tool.Agent != nil:
-			agentRef := types.NamespacedName{
-				Namespace: agent.Namespace,
-				Name:      tool.Agent.Name,
-			}
+			agentRef := tool.Agent.NamespacedName(agent.Namespace)
 
 			if agentRef.Namespace == agent.Namespace && agentRef.Name == agent.Name {
 				return nil, nil, nil, fmt.Errorf("agent tool cannot be used to reference itself, %s", agentRef)
 			}
 
-			// Translate a nested tool
 			toolAgent := &v1alpha2.Agent{}
 			err := a.kube.Get(ctx, agentRef, toolAgent)
 			if err != nil {
@@ -566,15 +595,20 @@ func (a *adkApiTranslator) translateInlineAgent(ctx context.Context, agent *v1al
 
 			switch toolAgent.Spec.Type {
 			case v1alpha2.AgentType_BYO, v1alpha2.AgentType_Declarative:
-				url := fmt.Sprintf("http://%s.%s:8080", toolAgent.Name, toolAgent.Namespace)
-				headers, err := tool.ResolveHeaders(ctx, a.kube, agent.Namespace)
-				if err != nil {
-					return nil, nil, nil, err
+				originalURL := fmt.Sprintf("http://%s.%s:8080", toolAgent.Name, toolAgent.Namespace)
+
+				// If proxy is configured, use proxy URL and set header for Gateway API routing
+				targetURL := originalURL
+				if a.globalProxyURL != "" {
+					targetURL, headers, err = applyProxyURL(originalURL, a.globalProxyURL, headers)
+					if err != nil {
+						return nil, nil, nil, err
+					}
 				}
 
 				cfg.RemoteAgents = append(cfg.RemoteAgents, adk.RemoteAgentConfig{
 					Name:        utils.ConvertToPythonIdentifier(utils.GetObjectRef(toolAgent)),
-					Url:         url,
+					Url:         targetURL,
 					Headers:     headers,
 					Description: toolAgent.Spec.Description,
 				})
@@ -587,7 +621,7 @@ func (a *adkApiTranslator) translateInlineAgent(ctx context.Context, agent *v1al
 		}
 	}
 
-	return cfg, agentCard, mdd, nil
+	return cfg, mdd, secretHashBytes, nil
 }
 
 func (a *adkApiTranslator) resolveSystemMessage(ctx context.Context, agent *v1alpha2.Agent) (string, error) {
@@ -655,11 +689,21 @@ func addTLSConfiguration(modelDeploymentData *modelDeploymentData, tlsConfig *v1
 	}
 }
 
-func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelConfig string) (adk.Model, *modelDeploymentData, error) {
+func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelConfig string) (adk.Model, *modelDeploymentData, []byte, error) {
 	model := &v1alpha2.ModelConfig{}
 	err := a.kube.Get(ctx, types.NamespacedName{Namespace: namespace, Name: modelConfig}, model)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
+	}
+
+	// Decode hex-encoded secret hash to bytes
+	var secretHashBytes []byte
+	if model.Status.SecretHash != "" {
+		decoded, err := hex.DecodeString(model.Status.SecretHash)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to decode secret hash: %w", err)
+		}
+		secretHashBytes = decoded
 	}
 
 	modelDeploymentData := &modelDeploymentData{}
@@ -722,7 +766,7 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 				})
 			}
 		}
-		return openai, modelDeploymentData, nil
+		return openai, modelDeploymentData, secretHashBytes, nil
 	case v1alpha2.ModelProviderAnthropic:
 		if model.Spec.APIKeySecret != "" {
 			modelDeploymentData.EnvVars = append(modelDeploymentData.EnvVars, corev1.EnvVar{
@@ -749,10 +793,10 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 		if model.Spec.Anthropic != nil {
 			anthropic.BaseUrl = model.Spec.Anthropic.BaseURL
 		}
-		return anthropic, modelDeploymentData, nil
+		return anthropic, modelDeploymentData, secretHashBytes, nil
 	case v1alpha2.ModelProviderAzureOpenAI:
 		if model.Spec.AzureOpenAI == nil {
-			return nil, nil, fmt.Errorf("AzureOpenAI model config is required")
+			return nil, nil, nil, fmt.Errorf("AzureOpenAI model config is required")
 		}
 		modelDeploymentData.EnvVars = append(modelDeploymentData.EnvVars, corev1.EnvVar{
 			Name: "AZURE_OPENAI_API_KEY",
@@ -792,10 +836,10 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 		// Populate TLS fields in BaseModel
 		populateTLSFields(&azureOpenAI.BaseModel, model.Spec.TLS)
 
-		return azureOpenAI, modelDeploymentData, nil
+		return azureOpenAI, modelDeploymentData, secretHashBytes, nil
 	case v1alpha2.ModelProviderGeminiVertexAI:
 		if model.Spec.GeminiVertexAI == nil {
-			return nil, nil, fmt.Errorf("GeminiVertexAI model config is required")
+			return nil, nil, nil, fmt.Errorf("GeminiVertexAI model config is required")
 		}
 		modelDeploymentData.EnvVars = append(modelDeploymentData.EnvVars, corev1.EnvVar{
 			Name:  "GOOGLE_CLOUD_PROJECT",
@@ -836,10 +880,10 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 		// Populate TLS fields in BaseModel
 		populateTLSFields(&gemini.BaseModel, model.Spec.TLS)
 
-		return gemini, modelDeploymentData, nil
+		return gemini, modelDeploymentData, secretHashBytes, nil
 	case v1alpha2.ModelProviderAnthropicVertexAI:
 		if model.Spec.AnthropicVertexAI == nil {
-			return nil, nil, fmt.Errorf("AnthropicVertexAI model config is required")
+			return nil, nil, nil, fmt.Errorf("AnthropicVertexAI model config is required")
 		}
 		modelDeploymentData.EnvVars = append(modelDeploymentData.EnvVars, corev1.EnvVar{
 			Name:  "GOOGLE_CLOUD_PROJECT",
@@ -876,25 +920,30 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 		// Populate TLS fields in BaseModel
 		populateTLSFields(&anthropic.BaseModel, model.Spec.TLS)
 
-		return anthropic, modelDeploymentData, nil
+		return anthropic, modelDeploymentData, secretHashBytes, nil
 	case v1alpha2.ModelProviderOllama:
 		if model.Spec.Ollama == nil {
-			return nil, nil, fmt.Errorf("ollama model config is required")
+			return nil, nil, nil, fmt.Errorf("ollama model config is required")
+		}
+		host := model.Spec.Ollama.Host
+		if !strings.HasPrefix(host, "http://") && !strings.HasPrefix(host, "https://") {
+			host = "http://" + host
 		}
 		modelDeploymentData.EnvVars = append(modelDeploymentData.EnvVars, corev1.EnvVar{
 			Name:  "OLLAMA_API_BASE",
-			Value: model.Spec.Ollama.Host,
+			Value: host,
 		})
 		ollama := &adk.Ollama{
 			BaseModel: adk.BaseModel{
 				Model:   model.Spec.Model,
 				Headers: model.Spec.DefaultHeaders,
 			},
+			Options: model.Spec.Ollama.Options,
 		}
 		// Populate TLS fields in BaseModel
 		populateTLSFields(&ollama.BaseModel, model.Spec.TLS)
 
-		return ollama, modelDeploymentData, nil
+		return ollama, modelDeploymentData, secretHashBytes, nil
 	case v1alpha2.ModelProviderGemini:
 		modelDeploymentData.EnvVars = append(modelDeploymentData.EnvVars, corev1.EnvVar{
 			Name: "GOOGLE_API_KEY",
@@ -916,53 +965,159 @@ func (a *adkApiTranslator) translateModel(ctx context.Context, namespace, modelC
 		// Populate TLS fields in BaseModel
 		populateTLSFields(&gemini.BaseModel, model.Spec.TLS)
 
-		return gemini, modelDeploymentData, nil
+		return gemini, modelDeploymentData, secretHashBytes, nil
+	case v1alpha2.ModelProviderBedrock:
+		if model.Spec.Bedrock == nil {
+			return nil, nil, nil, fmt.Errorf("bedrock model config is required")
+		}
+
+		// Set AWS region (always required)
+		modelDeploymentData.EnvVars = append(modelDeploymentData.EnvVars, corev1.EnvVar{
+			Name:  "AWS_REGION",
+			Value: model.Spec.Bedrock.Region,
+		})
+
+		// If AWS_BEARER_TOKEN_BEDROCK key exists: use bearer token auth
+		// Otherwise, use IAM credentials
+		if model.Spec.APIKeySecret != "" {
+			secret := &corev1.Secret{}
+			if err := a.kube.Get(ctx, types.NamespacedName{Namespace: namespace, Name: model.Spec.APIKeySecret}, secret); err != nil {
+				return nil, nil, nil, fmt.Errorf("failed to get Bedrock credentials secret: %w", err)
+			}
+
+			if _, hasBearerToken := secret.Data["AWS_BEARER_TOKEN_BEDROCK"]; hasBearerToken {
+				modelDeploymentData.EnvVars = append(modelDeploymentData.EnvVars, corev1.EnvVar{
+					Name: "AWS_BEARER_TOKEN_BEDROCK",
+					ValueFrom: &corev1.EnvVarSource{
+						SecretKeyRef: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
+								Name: model.Spec.APIKeySecret,
+							},
+							Key: "AWS_BEARER_TOKEN_BEDROCK",
+						},
+					},
+				})
+			} else {
+				modelDeploymentData.EnvVars = append(modelDeploymentData.EnvVars, corev1.EnvVar{
+					Name: "AWS_ACCESS_KEY_ID",
+					ValueFrom: &corev1.EnvVarSource{
+						SecretKeyRef: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
+								Name: model.Spec.APIKeySecret,
+							},
+							Key: "AWS_ACCESS_KEY_ID",
+						},
+					},
+				})
+				modelDeploymentData.EnvVars = append(modelDeploymentData.EnvVars, corev1.EnvVar{
+					Name: "AWS_SECRET_ACCESS_KEY",
+					ValueFrom: &corev1.EnvVarSource{
+						SecretKeyRef: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
+								Name: model.Spec.APIKeySecret,
+							},
+							Key: "AWS_SECRET_ACCESS_KEY",
+						},
+					},
+				})
+				// AWS_SESSION_TOKEN is optional, only needed for temporary/SSO credentials
+				if _, hasSessionToken := secret.Data["AWS_SESSION_TOKEN"]; hasSessionToken {
+					modelDeploymentData.EnvVars = append(modelDeploymentData.EnvVars, corev1.EnvVar{
+						Name: "AWS_SESSION_TOKEN",
+						ValueFrom: &corev1.EnvVarSource{
+							SecretKeyRef: &corev1.SecretKeySelector{
+								LocalObjectReference: corev1.LocalObjectReference{
+									Name: model.Spec.APIKeySecret,
+								},
+								Key: "AWS_SESSION_TOKEN",
+							},
+						},
+					})
+				}
+			}
+		}
+		bedrock := &adk.Bedrock{
+			BaseModel: adk.BaseModel{
+				Model:   model.Spec.Model,
+				Headers: model.Spec.DefaultHeaders,
+			},
+			Region: model.Spec.Bedrock.Region,
+		}
+
+		// Populate TLS fields in BaseModel
+		populateTLSFields(&bedrock.BaseModel, model.Spec.TLS)
+
+		return bedrock, modelDeploymentData, secretHashBytes, nil
 	}
-	return nil, nil, fmt.Errorf("unknown model provider: %s", model.Spec.Provider)
+
+	return nil, nil, nil, fmt.Errorf("unknown model provider: %s", model.Spec.Provider)
 }
 
-func (a *adkApiTranslator) translateStreamableHttpTool(ctx context.Context, tool *v1alpha2.RemoteMCPServerSpec, namespace string) (*adk.StreamableHTTPConnectionParams, error) {
-	headers, err := tool.ResolveHeaders(ctx, a.kube, namespace)
+func (a *adkApiTranslator) translateStreamableHttpTool(ctx context.Context, server *v1alpha2.RemoteMCPServer, agentHeaders map[string]string, proxyURL string) (*adk.StreamableHTTPConnectionParams, error) {
+	headers, err := server.ResolveHeaders(ctx, a.kube)
 	if err != nil {
 		return nil, err
+	}
+	// Agent headers override tool headers
+	maps.Copy(headers, agentHeaders)
+
+	// If proxy is configured, use proxy URL and set header for Gateway API routing
+	targetURL := server.Spec.URL
+	if proxyURL != "" {
+		targetURL, headers, err = applyProxyURL(targetURL, proxyURL, headers)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	params := &adk.StreamableHTTPConnectionParams{
-		Url:     tool.URL,
+		Url:     targetURL,
 		Headers: headers,
 	}
-	if tool.Timeout != nil {
-		params.Timeout = ptr.To(tool.Timeout.Seconds())
+	if server.Spec.Timeout != nil {
+		params.Timeout = ptr.To(server.Spec.Timeout.Seconds())
 	}
-	if tool.SseReadTimeout != nil {
-		params.SseReadTimeout = ptr.To(tool.SseReadTimeout.Seconds())
+	if server.Spec.SseReadTimeout != nil {
+		params.SseReadTimeout = ptr.To(server.Spec.SseReadTimeout.Seconds())
 	}
-	if tool.TerminateOnClose != nil {
-		params.TerminateOnClose = tool.TerminateOnClose
+	if server.Spec.TerminateOnClose != nil {
+		params.TerminateOnClose = server.Spec.TerminateOnClose
 	}
+
 	return params, nil
 }
 
-func (a *adkApiTranslator) translateSseHttpTool(ctx context.Context, tool *v1alpha2.RemoteMCPServerSpec, namespace string) (*adk.SseConnectionParams, error) {
-	headers, err := tool.ResolveHeaders(ctx, a.kube, namespace)
+func (a *adkApiTranslator) translateSseHttpTool(ctx context.Context, server *v1alpha2.RemoteMCPServer, agentHeaders map[string]string, proxyURL string) (*adk.SseConnectionParams, error) {
+	headers, err := server.ResolveHeaders(ctx, a.kube)
 	if err != nil {
 		return nil, err
 	}
+	// Agent headers override tool headers
+	maps.Copy(headers, agentHeaders)
+
+	// If proxy is configured, use proxy URL and set header for Gateway API routing
+	targetURL := server.Spec.URL
+	if proxyURL != "" {
+		targetURL, headers, err = applyProxyURL(targetURL, proxyURL, headers)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	params := &adk.SseConnectionParams{
-		Url:     tool.URL,
+		Url:     targetURL,
 		Headers: headers,
 	}
-	if tool.Timeout != nil {
-		params.Timeout = ptr.To(tool.Timeout.Seconds())
+	if server.Spec.Timeout != nil {
+		params.Timeout = ptr.To(server.Spec.Timeout.Seconds())
 	}
-	if tool.SseReadTimeout != nil {
-		params.SseReadTimeout = ptr.To(tool.SseReadTimeout.Seconds())
+	if server.Spec.SseReadTimeout != nil {
+		params.SseReadTimeout = ptr.To(server.Spec.SseReadTimeout.Seconds())
 	}
 	return params, nil
 }
 
-func (a *adkApiTranslator) translateMCPServerTarget(ctx context.Context, agent *adk.AgentConfig, agentNamespace string, toolServer *v1alpha2.McpServerTool, toolHeaders []v1alpha2.ValueRef) error {
+func (a *adkApiTranslator) translateMCPServerTarget(ctx context.Context, agent *adk.AgentConfig, agentNamespace string, toolServer *v1alpha2.McpServerTool, agentHeaders map[string]string, proxyURL string) error {
 	gvk := toolServer.GroupKind()
 
 	switch gvk {
@@ -981,19 +1136,20 @@ func (a *adkApiTranslator) translateMCPServerTarget(ctx context.Context, agent *
 		Kind:  "MCPServer",
 	}:
 		mcpServer := &v1alpha1.MCPServer{}
-		err := a.kube.Get(ctx, types.NamespacedName{Namespace: agentNamespace, Name: toolServer.Name}, mcpServer)
+		mcpServerRef := toolServer.NamespacedName(agentNamespace)
+
+		err := a.kube.Get(ctx, mcpServerRef, mcpServer)
 		if err != nil {
 			return err
 		}
 
-		spec, err := ConvertMCPServerToRemoteMCPServer(mcpServer)
+		remoteMcpServer, err := ConvertMCPServerToRemoteMCPServer(mcpServer)
 		if err != nil {
 			return err
 		}
 
-		spec.HeadersFrom = append(spec.HeadersFrom, toolHeaders...)
+		return a.translateRemoteMCPServerTarget(ctx, agent, remoteMcpServer, toolServer, agentHeaders, proxyURL)
 
-		return a.translateRemoteMCPServerTarget(ctx, agent, agentNamespace, spec, toolServer.ToolNames)
 	case schema.GroupKind{
 		Group: "",
 		Kind:  "RemoteMCPServer",
@@ -1004,14 +1160,21 @@ func (a *adkApiTranslator) translateMCPServerTarget(ctx context.Context, agent *
 		Kind:  "RemoteMCPServer",
 	}:
 		remoteMcpServer := &v1alpha2.RemoteMCPServer{}
-		err := a.kube.Get(ctx, types.NamespacedName{Namespace: agentNamespace, Name: toolServer.Name}, remoteMcpServer)
+		remoteMcpServerRef := toolServer.NamespacedName(agentNamespace)
+
+		err := a.kube.Get(ctx, remoteMcpServerRef, remoteMcpServer)
 		if err != nil {
 			return err
 		}
 
-		remoteMcpServer.Spec.HeadersFrom = append(remoteMcpServer.Spec.HeadersFrom, toolHeaders...)
+		// RemoteMCPServer uses user-supplied URLs, but if the URL points to an internal k8s service,
+		// apply proxy to route through the gateway
+		proxyURL := ""
+		if a.globalProxyURL != "" && a.isInternalK8sURL(ctx, remoteMcpServer.Spec.URL, agentNamespace) {
+			proxyURL = a.globalProxyURL
+		}
 
-		return a.translateRemoteMCPServerTarget(ctx, agent, agentNamespace, &remoteMcpServer.Spec, toolServer.ToolNames)
+		return a.translateRemoteMCPServerTarget(ctx, agent, remoteMcpServer, toolServer, agentHeaders, proxyURL)
 	case schema.GroupKind{
 		Group: "",
 		Kind:  "Service",
@@ -1022,26 +1185,25 @@ func (a *adkApiTranslator) translateMCPServerTarget(ctx context.Context, agent *
 		Kind:  "Service",
 	}:
 		svc := &corev1.Service{}
-		err := a.kube.Get(ctx, types.NamespacedName{Namespace: agentNamespace, Name: toolServer.Name}, svc)
+		svcRef := toolServer.NamespacedName(agentNamespace)
+
+		err := a.kube.Get(ctx, svcRef, svc)
 		if err != nil {
 			return err
 		}
 
-		spec, err := ConvertServiceToRemoteMCPServer(svc)
+		remoteMcpServer, err := ConvertServiceToRemoteMCPServer(svc)
 		if err != nil {
 			return err
 		}
 
-		spec.HeadersFrom = append(spec.HeadersFrom, toolHeaders...)
-
-		return a.translateRemoteMCPServerTarget(ctx, agent, agentNamespace, spec, toolServer.ToolNames)
-
+		return a.translateRemoteMCPServerTarget(ctx, agent, remoteMcpServer, toolServer, agentHeaders, proxyURL)
 	default:
 		return fmt.Errorf("unknown tool server type: %s", gvk)
 	}
 }
 
-func ConvertServiceToRemoteMCPServer(svc *corev1.Service) (*v1alpha2.RemoteMCPServerSpec, error) {
+func ConvertServiceToRemoteMCPServer(svc *corev1.Service) (*v1alpha2.RemoteMCPServer, error) {
 	// Check wellknown annotations
 	port := int64(0)
 	protocol := string(MCPServiceProtocolDefault)
@@ -1051,7 +1213,7 @@ func ConvertServiceToRemoteMCPServer(svc *corev1.Service) (*v1alpha2.RemoteMCPSe
 			var err error
 			port, err = strconv.ParseInt(portStr, 10, 64)
 			if err != nil {
-				return nil, fmt.Errorf("port in annotation %s is not a valid integer: %v", MCPServicePortAnnotation, err)
+				return nil, NewValidationError("port in annotation %s is not a valid integer: %v", MCPServicePortAnnotation, err)
 			}
 		}
 		if protocolStr, ok := svc.Annotations[MCPServiceProtocolAnnotation]; ok {
@@ -1080,44 +1242,58 @@ func ConvertServiceToRemoteMCPServer(svc *corev1.Service) (*v1alpha2.RemoteMCPSe
 		}
 	}
 	if port == 0 {
-		return nil, fmt.Errorf("no port found for service %s with protocol %s", svc.Name, protocol)
+		return nil, NewValidationError("no port found for service %s with protocol %s", svc.Name, protocol)
 	}
-	return &v1alpha2.RemoteMCPServerSpec{
-		URL:      fmt.Sprintf("http://%s.%s:%d%s", svc.Name, svc.Namespace, port, path),
-		Protocol: v1alpha2.RemoteMCPServerProtocol(protocol),
+	return &v1alpha2.RemoteMCPServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      svc.Name,
+			Namespace: svc.Namespace,
+		},
+		Spec: v1alpha2.RemoteMCPServerSpec{
+			URL:      fmt.Sprintf("http://%s.%s:%d%s", svc.Name, svc.Namespace, port, path),
+			Protocol: v1alpha2.RemoteMCPServerProtocol(protocol),
+		},
 	}, nil
 }
 
-func ConvertMCPServerToRemoteMCPServer(mcpServer *v1alpha1.MCPServer) (*v1alpha2.RemoteMCPServerSpec, error) {
+func ConvertMCPServerToRemoteMCPServer(mcpServer *v1alpha1.MCPServer) (*v1alpha2.RemoteMCPServer, error) {
 	if mcpServer.Spec.Deployment.Port == 0 {
-		return nil, fmt.Errorf("cannot determine port for MCP server %s", mcpServer.Name)
+		return nil, NewValidationError("cannot determine port for MCP server %s", mcpServer.Name)
 	}
 
-	return &v1alpha2.RemoteMCPServerSpec{
-		URL:      fmt.Sprintf("http://%s.%s:%d/mcp", mcpServer.Name, mcpServer.Namespace, mcpServer.Spec.Deployment.Port),
-		Protocol: v1alpha2.RemoteMCPServerProtocolStreamableHttp,
+	return &v1alpha2.RemoteMCPServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      mcpServer.Name,
+			Namespace: mcpServer.Namespace,
+		},
+		Spec: v1alpha2.RemoteMCPServerSpec{
+			URL:      fmt.Sprintf("http://%s.%s:%d/mcp", mcpServer.Name, mcpServer.Namespace, mcpServer.Spec.Deployment.Port),
+			Protocol: v1alpha2.RemoteMCPServerProtocolStreamableHttp,
+		},
 	}, nil
 }
 
-func (a *adkApiTranslator) translateRemoteMCPServerTarget(ctx context.Context, agent *adk.AgentConfig, agentNamespace string, remoteMcpServer *v1alpha2.RemoteMCPServerSpec, toolNames []string) error {
-	switch remoteMcpServer.Protocol {
+func (a *adkApiTranslator) translateRemoteMCPServerTarget(ctx context.Context, agent *adk.AgentConfig, remoteMcpServer *v1alpha2.RemoteMCPServer, mcpServerTool *v1alpha2.McpServerTool, agentHeaders map[string]string, proxyURL string) error {
+	switch remoteMcpServer.Spec.Protocol {
 	case v1alpha2.RemoteMCPServerProtocolSse:
-		tool, err := a.translateSseHttpTool(ctx, remoteMcpServer, agentNamespace)
+		tool, err := a.translateSseHttpTool(ctx, remoteMcpServer, agentHeaders, proxyURL)
 		if err != nil {
 			return err
 		}
 		agent.SseTools = append(agent.SseTools, adk.SseMcpServerConfig{
-			Params: *tool,
-			Tools:  toolNames,
+			Params:         *tool,
+			Tools:          mcpServerTool.ToolNames,
+			AllowedHeaders: mcpServerTool.AllowedHeaders,
 		})
 	default:
-		tool, err := a.translateStreamableHttpTool(ctx, remoteMcpServer, agentNamespace)
+		tool, err := a.translateStreamableHttpTool(ctx, remoteMcpServer, agentHeaders, proxyURL)
 		if err != nil {
 			return err
 		}
 		agent.HttpTools = append(agent.HttpTools, adk.HttpMcpServerConfig{
-			Params: *tool,
-			Tools:  toolNames,
+			Params:         *tool,
+			Tools:          mcpServerTool.ToolNames,
+			AllowedHeaders: mcpServerTool.AllowedHeaders,
 		})
 	}
 	return nil
@@ -1125,10 +1301,74 @@ func (a *adkApiTranslator) translateRemoteMCPServerTarget(ctx context.Context, a
 
 // Helper functions
 
-func computeConfigHash(config, card []byte) uint64 {
+// isInternalK8sURL checks if a URL points to an internal Kubernetes service.
+// Internal k8s URLs follow the pattern: http://{name}.{namespace}:{port} or
+// http://{name}.{namespace}.svc.cluster.local:{port}
+// This method checks if the namespace exists in the cluster to determine if it's internal.
+func (a *adkApiTranslator) isInternalK8sURL(ctx context.Context, urlStr, namespace string) bool {
+	parsedURL, err := url.Parse(urlStr)
+	if err != nil {
+		return false
+	}
+
+	hostname := parsedURL.Hostname()
+	if hostname == "" {
+		return false
+	}
+
+	// Check if it ends with .svc.cluster.local (definitely internal)
+	if strings.HasSuffix(hostname, ".svc.cluster.local") {
+		return true
+	}
+
+	// Extract namespace from hostname pattern: {name}.{namespace}
+	// Examples: test-mcp-server.kagent -> namespace is "kagent"
+	parts := strings.Split(hostname, ".")
+	if len(parts) == 2 {
+		potentialNamespace := parts[1]
+
+		// Check if this namespace exists in the cluster
+		ns := &corev1.Namespace{}
+		err := a.kube.Get(ctx, types.NamespacedName{Name: potentialNamespace}, ns)
+		if err == nil {
+			// Namespace exists, so this is an internal k8s URL
+			return true
+		}
+		// If namespace doesn't exist, it's likely a TLD or external domain
+	}
+
+	return false
+}
+
+func applyProxyURL(originalURL, proxyURL string, headers map[string]string) (targetURL string, updatedHeaders map[string]string, err error) {
+	// Parse original URL to extract path and hostname
+	originalURLParsed, err := url.Parse(originalURL)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to parse original URL %q: %w", originalURL, err)
+	}
+	proxyURLParsed, err := url.Parse(proxyURL)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to parse proxy URL %q: %w", proxyURL, err)
+	}
+
+	// Use proxy URL with original path
+	targetURL = fmt.Sprintf("%s://%s%s", proxyURLParsed.Scheme, proxyURLParsed.Host, originalURLParsed.Path)
+
+	// Set header to original hostname (without port) for Gateway API routing
+	updatedHeaders = headers
+	if updatedHeaders == nil {
+		updatedHeaders = make(map[string]string)
+	}
+	updatedHeaders[ProxyHostHeader] = originalURLParsed.Hostname()
+
+	return targetURL, updatedHeaders, nil
+}
+
+func computeConfigHash(agentCfg, agentCard, secretData []byte) uint64 {
 	hasher := sha256.New()
-	hasher.Write(config)
-	hasher.Write(card)
+	hasher.Write(agentCfg)
+	hasher.Write(agentCard)
+	hasher.Write(secretData)
 	hash := hasher.Sum(nil)
 	return binary.BigEndian.Uint64(hash[:8])
 }
@@ -1176,17 +1416,21 @@ type resolvedDeployment struct {
 	ImagePullPolicy corev1.PullPolicy
 
 	// SharedDeploymentSpec merged
-	Replicas         *int32
-	ImagePullSecrets []corev1.LocalObjectReference
-	Volumes          []corev1.Volume
-	VolumeMounts     []corev1.VolumeMount
-	Labels           map[string]string
-	Annotations      map[string]string
-	Env              []corev1.EnvVar
-	Resources        corev1.ResourceRequirements
-	Tolerations      []corev1.Toleration
-	Affinity         *corev1.Affinity
-	NodeSelector     map[string]string
+	Replicas             *int32
+	ImagePullSecrets     []corev1.LocalObjectReference
+	Volumes              []corev1.Volume
+	VolumeMounts         []corev1.VolumeMount
+	Labels               map[string]string
+	Annotations          map[string]string
+	Env                  []corev1.EnvVar
+	Resources            corev1.ResourceRequirements
+	Tolerations          []corev1.Toleration
+	Affinity             *corev1.Affinity
+	NodeSelector         map[string]string
+	SecurityContext      *corev1.SecurityContext
+	PodSecurityContext   *corev1.PodSecurityContext
+	ServiceAccountName   *string
+	ServiceAccountConfig *v1alpha2.ServiceAccountConfig
 }
 
 // getDefaultResources sets default resource requirements if not specified
@@ -1228,6 +1472,8 @@ func (a *adkApiTranslator) resolveInlineDeployment(agent *v1alpha2.Agent, mdd *m
 		"/config",
 	}
 
+	serviceAccountName := ptr.To(agent.Name)
+
 	// Start with spec deployment spec
 	spec := v1alpha2.DeclarativeDeploymentSpec{}
 	if agent.Spec.Declarative.Deployment != nil {
@@ -1254,21 +1500,30 @@ func (a *adkApiTranslator) resolveInlineDeployment(agent *v1alpha2.Agent, mdd *m
 	}
 
 	dep := &resolvedDeployment{
-		Image:            image,
-		Args:             args,
-		Port:             port,
-		ImagePullPolicy:  imagePullPolicy,
-		Replicas:         spec.Replicas,
-		ImagePullSecrets: slices.Clone(spec.ImagePullSecrets),
-		Volumes:          append(slices.Clone(spec.Volumes), mdd.Volumes...),
-		VolumeMounts:     append(slices.Clone(spec.VolumeMounts), mdd.VolumeMounts...),
-		Labels:           getDefaultLabels(agent.Name, spec.Labels),
-		Annotations:      maps.Clone(spec.Annotations),
-		Env:              append(slices.Clone(spec.Env), mdd.EnvVars...),
-		Resources:        getDefaultResources(spec.Resources), // Set default resources if not specified
-		Tolerations:      slices.Clone(spec.Tolerations),
-		Affinity:         spec.Affinity,
-		NodeSelector:     maps.Clone(spec.NodeSelector),
+		Image:                image,
+		Args:                 args,
+		Port:                 port,
+		ImagePullPolicy:      imagePullPolicy,
+		Replicas:             spec.Replicas,
+		ImagePullSecrets:     slices.Clone(spec.ImagePullSecrets),
+		Volumes:              append(slices.Clone(spec.Volumes), mdd.Volumes...),
+		VolumeMounts:         append(slices.Clone(spec.VolumeMounts), mdd.VolumeMounts...),
+		Labels:               getDefaultLabels(agent.Name, spec.Labels),
+		Annotations:          maps.Clone(spec.Annotations),
+		Env:                  append(slices.Clone(spec.Env), mdd.EnvVars...),
+		Resources:            getDefaultResources(spec.Resources), // Set default resources if not specified
+		Tolerations:          slices.Clone(spec.Tolerations),
+		Affinity:             spec.Affinity,
+		NodeSelector:         maps.Clone(spec.NodeSelector),
+		SecurityContext:      spec.SecurityContext,
+		PodSecurityContext:   spec.PodSecurityContext,
+		ServiceAccountName:   spec.ServiceAccountName,
+		ServiceAccountConfig: spec.ServiceAccountConfig,
+	}
+
+	// If not specified, use the agent name as the service account name
+	if dep.ServiceAccountName == nil {
+		dep.ServiceAccountName = serviceAccountName
 	}
 
 	return dep, nil
@@ -1321,22 +1576,30 @@ func (a *adkApiTranslator) resolveByoDeployment(agent *v1alpha2.Agent) (*resolve
 	}
 
 	dep := &resolvedDeployment{
-		Image:            image,
-		Cmd:              cmd,
-		Args:             args,
-		Port:             port,
-		ImagePullPolicy:  imagePullPolicy,
-		Replicas:         replicas,
-		ImagePullSecrets: slices.Clone(spec.ImagePullSecrets),
-		Volumes:          slices.Clone(spec.Volumes),
-		VolumeMounts:     slices.Clone(spec.VolumeMounts),
-		Labels:           getDefaultLabels(agent.Name, spec.Labels),
-		Annotations:      maps.Clone(spec.Annotations),
-		Env:              slices.Clone(spec.Env),
-		Resources:        getDefaultResources(spec.Resources), // Set default resources if not specified
-		Tolerations:      slices.Clone(spec.Tolerations),
-		Affinity:         spec.Affinity,
-		NodeSelector:     maps.Clone(spec.NodeSelector),
+		Image:                image,
+		Cmd:                  cmd,
+		Args:                 args,
+		Port:                 port,
+		ImagePullPolicy:      imagePullPolicy,
+		Replicas:             replicas,
+		ImagePullSecrets:     slices.Clone(spec.ImagePullSecrets),
+		Volumes:              slices.Clone(spec.Volumes),
+		VolumeMounts:         slices.Clone(spec.VolumeMounts),
+		Labels:               getDefaultLabels(agent.Name, spec.Labels),
+		Annotations:          maps.Clone(spec.Annotations),
+		Env:                  slices.Clone(spec.Env),
+		Resources:            getDefaultResources(spec.Resources), // Set default resources if not specified
+		Tolerations:          slices.Clone(spec.Tolerations),
+		Affinity:             spec.Affinity,
+		NodeSelector:         maps.Clone(spec.NodeSelector),
+		SecurityContext:      spec.SecurityContext,
+		PodSecurityContext:   spec.PodSecurityContext,
+		ServiceAccountName:   spec.ServiceAccountName,
+		ServiceAccountConfig: spec.ServiceAccountConfig,
+	}
+
+	if dep.ServiceAccountName == nil {
+		dep.ServiceAccountName = ptr.To(agent.Name)
 	}
 
 	return dep, nil

@@ -16,8 +16,9 @@ type StreamableHTTPConnectionParams struct {
 }
 
 type HttpMcpServerConfig struct {
-	Params StreamableHTTPConnectionParams `json:"params"`
-	Tools  []string                       `json:"tools"`
+	Params         StreamableHTTPConnectionParams `json:"params"`
+	Tools          []string                       `json:"tools"`
+	AllowedHeaders []string                       `json:"allowed_headers,omitempty"`
 }
 
 type SseConnectionParams struct {
@@ -28,8 +29,9 @@ type SseConnectionParams struct {
 }
 
 type SseMcpServerConfig struct {
-	Params SseConnectionParams `json:"params"`
-	Tools  []string            `json:"tools"`
+	Params         SseConnectionParams `json:"params"`
+	Tools          []string            `json:"tools"`
+	AllowedHeaders []string            `json:"allowed_headers,omitempty"`
 }
 
 type Model interface {
@@ -69,6 +71,7 @@ const (
 	ModelTypeGeminiAnthropic = "gemini_anthropic"
 	ModelTypeOllama          = "ollama"
 	ModelTypeGemini          = "gemini"
+	ModelTypeBedrock         = "bedrock"
 )
 
 func (o *OpenAI) MarshalJSON() ([]byte, error) {
@@ -96,7 +99,7 @@ func (a *AzureOpenAI) GetType() string {
 }
 
 func (a *AzureOpenAI) MarshalJSON() ([]byte, error) {
-	return json.Marshal(map[string]interface{}{
+	return json.Marshal(map[string]any{
 		"type":    ModelTypeAzureOpenAI,
 		"model":   a.Model,
 		"headers": a.Headers,
@@ -109,7 +112,7 @@ type Anthropic struct {
 }
 
 func (a *Anthropic) MarshalJSON() ([]byte, error) {
-	return json.Marshal(map[string]interface{}{
+	return json.Marshal(map[string]any{
 		"type":     ModelTypeAnthropic,
 		"model":    a.Model,
 		"base_url": a.BaseUrl,
@@ -126,7 +129,7 @@ type GeminiVertexAI struct {
 }
 
 func (g *GeminiVertexAI) MarshalJSON() ([]byte, error) {
-	return json.Marshal(map[string]interface{}{
+	return json.Marshal(map[string]any{
 		"type":    ModelTypeGeminiVertexAI,
 		"model":   g.Model,
 		"headers": g.Headers,
@@ -142,7 +145,7 @@ type GeminiAnthropic struct {
 }
 
 func (g *GeminiAnthropic) MarshalJSON() ([]byte, error) {
-	return json.Marshal(map[string]interface{}{
+	return json.Marshal(map[string]any{
 		"type":    ModelTypeGeminiAnthropic,
 		"model":   g.Model,
 		"headers": g.Headers,
@@ -155,13 +158,15 @@ func (g *GeminiAnthropic) GetType() string {
 
 type Ollama struct {
 	BaseModel
+	Options map[string]string `json:"options,omitempty"`
 }
 
 func (o *Ollama) MarshalJSON() ([]byte, error) {
-	return json.Marshal(map[string]interface{}{
+	return json.Marshal(map[string]any{
 		"type":    ModelTypeOllama,
 		"model":   o.Model,
 		"headers": o.Headers,
+		"options": o.Options,
 	})
 }
 
@@ -174,7 +179,7 @@ type Gemini struct {
 }
 
 func (g *Gemini) MarshalJSON() ([]byte, error) {
-	return json.Marshal(map[string]interface{}{
+	return json.Marshal(map[string]any{
 		"type":    ModelTypeGemini,
 		"model":   g.Model,
 		"headers": g.Headers,
@@ -183,6 +188,28 @@ func (g *Gemini) MarshalJSON() ([]byte, error) {
 
 func (g *Gemini) GetType() string {
 	return ModelTypeGemini
+}
+
+type Bedrock struct {
+	BaseModel
+	// Region is the AWS region where the model is available
+	Region string `json:"region,omitempty"`
+}
+
+func (b *Bedrock) MarshalJSON() ([]byte, error) {
+	data := map[string]any{
+		"type":    ModelTypeBedrock,
+		"model":   b.Model,
+		"headers": b.Headers,
+	}
+	if b.Region != "" {
+		data["region"] = b.Region
+	}
+	return json.Marshal(data)
+}
+
+func (b *Bedrock) GetType() string {
+	return ModelTypeBedrock
 }
 
 func ParseModel(bytes []byte) (Model, error) {
@@ -233,6 +260,12 @@ func ParseModel(bytes []byte) (Model, error) {
 			return nil, err
 		}
 		return &ollama, nil
+	case ModelTypeBedrock:
+		var bedrock Bedrock
+		if err := json.Unmarshal(bytes, &bedrock); err != nil {
+			return nil, err
+		}
+		return &bedrock, nil
 	}
 	return nil, fmt.Errorf("unknown model type: %s", model.Type)
 }
@@ -253,6 +286,7 @@ type AgentConfig struct {
 	SseTools     []SseMcpServerConfig  `json:"sse_tools"`
 	RemoteAgents []RemoteAgentConfig   `json:"remote_agents"`
 	ExecuteCode  bool                  `json:"execute_code,omitempty"`
+	Stream       bool                  `json:"stream"`
 }
 
 func (a *AgentConfig) UnmarshalJSON(data []byte) error {
@@ -282,7 +316,7 @@ func (a *AgentConfig) UnmarshalJSON(data []byte) error {
 
 var _ sql.Scanner = &AgentConfig{}
 
-func (a *AgentConfig) Scan(value interface{}) error {
+func (a *AgentConfig) Scan(value any) error {
 	return json.Unmarshal(value.([]byte), a)
 }
 
