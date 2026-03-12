@@ -126,6 +126,7 @@ class KAgentApp:
         # Configure tracing/instrumentation if enabled
         if self._enable_tracing:
             try:
+                logger.info("HELLO WORLD")
                 configure_tracing(self.config.name, self.config.namespace, app)
                 logger.info("Tracing configured for KAgent LangGraph app")
             except Exception:
