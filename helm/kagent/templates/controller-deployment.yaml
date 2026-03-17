@@ -29,6 +29,32 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "kagent.fullname" . }}-controller
+      {{- if and (not .Values.database.postgres.url) (not .Values.database.postgres.urlFile) }}
+      initContainers:
+        - name: wait-for-postgres
+          image: "{{ .Values.database.postgres.bundled.image }}"
+          command:
+            - "sh"
+            - "-c"
+            - |
+              timeout=120
+              delay=2
+              elapsed=0
+              until pg_isready -h {{ include "kagent.fullname" . }}-postgresql -p 5432 -U {{ .Values.database.postgres.bundled.user }}; do
+                elapsed=$((elapsed + delay))
+                if [ "$elapsed" -ge "$timeout" ]; then
+                  echo "timed out after ${timeout}s waiting for postgres"
+                  exit 1
+                fi
+                echo "waiting for postgres... (${elapsed}s/${timeout}s)"
+                sleep "$delay"
+                # simple backoff, cap at 10s
+                if [ "$delay" -lt 10 ]; then
+                  delay=$((delay + 2))
+                fi
+              done
+              echo "postgres is ready"
+      {{- end }}
       {{- if gt (len .Values.controller.volumes) 0 }}
       volumes:
       {{- with .Values.controller.volumes }}
